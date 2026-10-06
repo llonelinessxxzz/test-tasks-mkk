@@ -1,0 +1,148 @@
+name: payment-processing
+
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  environment:
+    API_KEY: ${API_KEY:?Copy .env.example to .env}
+    DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+    RABBITMQ_URL: amqp://payments:payments@rabbitmq:5672/
+    OUTBOX_POLL_SECONDS: ${OUTBOX_POLL_SECONDS:-1}
+    PUBLISH_TIMEOUT_SECONDS: ${PUBLISH_TIMEOUT_SECONDS:-10}
+    WEBHOOK_TIMEOUT_SECONDS: ${WEBHOOK_TIMEOUT_SECONDS:-10}
+    RETRY_DELAY_SECONDS: ${RETRY_DELAY_SECONDS:-2}
+  restart: unless-stopped
+  init: true
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: payments
+      RABBITMQ_DEFAULT_PASS: payments
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    ports:
+      - "127.0.0.1:8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, urllib.request; urllib.request.urlopen(urllib.request.Request('http://localhost:8000/health', headers={'X-API-Key': os.environ['API_KEY']}), timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  consumer:
+    <<: *app
+    command: ["python", "-m", "app.consumer"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    stop_grace_period: 30s
+
+  webhook:
+    <<: *app
+    profiles: ["demo"]
+    command: ["python", "/demo/webhook.py"]
+    volumes:
+      - ./scripts:/demo:ro
+    ports:
+      - "127.0.0.1:8081:8081"
+
+  test-postgres:
+    image: postgres:17-alpine
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments_test
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  test-rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    profiles: ["test"]
+    environment:
+      RABBITMQ_DEFAULT_USER: payments
+      RABBITMQ_DEFAULT_PASS: payments
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  tests:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    environment:
+      API_KEY: test-api-key-at-least-16
+      DATABASE_URL: postgresql+asyncpg://payments:payments@test-postgres:5432/payments_test
+      TEST_DATABASE_URL: postgresql+asyncpg://payments:payments@test-postgres:5432/payments_test
+      TEST_RABBITMQ_URL: amqp://payments:payments@test-rabbitmq:5672/
+      PYTHONDONTWRITEBYTECODE: "1"
+    depends_on:
+      test-postgres:
+        condition: service_healthy
+      test-rabbitmq:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
